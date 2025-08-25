@@ -1,0 +1,123 @@
+# Make sure that NTFSSecurity Powreshell Module is installed
+$PSVersionCheck = "$(($PSVersionTable.PSVersion).Major).$(($PSVersionTable.PSVersion).Minor)"
+If ($PSVersionCheck -le "5.0") {
+    Write-Host "Need to upgrade Powershell"
+    exit
+}
+If ($null -eq (Get-Module -ListAvailable -Name NTFSSecurity)) {
+    Write-Host "Installing NTFSSecurity powershell module follow prompts..."
+    $InstallNTFSSecurityPowershell = "Install-Module -Name NTFSSecurity"
+    Start-Process -FilePath powershell.exe -ArgumentList $InstallNTFSSecurityPowershell -verb RunAs -Wait
+}
+
+# Get the folder we want to restrict access on
+$Folder = Read-Host "Enter FULL folder path to the folder you want to restrict. Example: \\Share\Accounting\TEST"
+$Folder = $Folder.ToUpper()
+$SecurityGroupOU = Read-Host "Enter dn for the group location Example: 'OU=Security Groups,DC=Domain,DC=com'. `r`nYou can change this to a direct value in the script if you don't want to enter every time."
+
+# Check exiting permissions
+Get-NTFSAccess -Path $Folder
+# Ask if we want to continue
+$Title = 'Continue Check'
+$Question = 'Do you need to create a new group or can you use one of the existing ones?'
+$Choices = '&New Group', '&Stop'
+$Decision = $Host.UI.PromptForChoice($Title, $Question, $Choices, 1)
+if ($decision -eq 0) {
+    Write-Host "Building new AD Group..."
+} 
+else {
+    Write-Host "Exiting script."
+    Exit
+}
+
+# Get what Domain Controller we should build the group on based off the file path.  Get the file server name then replace AP1 with AD1.
+$DC = (Get-ADDomain).PDCEmulator
+
+# Build what we want to call the group in AD and build it
+$GroupServerName = ($Folder.Split("-")[0]).Replace("\", "")
+$GroupPath = ($Folder.Replace("\\$GroupServerName\", "")).Replace("\", " - ")
+#Check group name length
+if ($GroupPath.Length -gt 50) {
+    $GroupName = "R - $GroupServerName - $($GroupPath.Split("-")[0])-$($GroupPath.Split("-")[1])--$($GroupPath.Split("-") | Select-Object -Last 1)"
+    while ($GroupName.Length -gt 63) {
+        $GroupName = read-host "Character Limit Exceeds 63, Please enter full desired Name starting with: R - $GroupServerName - $($GroupPath.Split("-")[0])"
+    }
+}
+Else {
+    # Group Name for AD
+    $GroupName = "R - $GroupServerName - $GroupPath"
+}
+
+
+# See if the group already exists, if not build it.
+try {
+    $ADGroupCheck = Get-ADGroup -Identity $GroupName -ErrorAction SilentlyContinue
+}
+catch {
+    If ($null -eq $ADGroupCheck) {
+        # Build the Group
+        $Hash = @{
+            Name            = $GroupName
+            Description     = $Folder
+            otherattributes = @{"info" = "Created $(Get-Date) by $env:userdomain\$env:username" }
+        }
+        New-ADGroup @Hash -GroupScope Universal -GroupCategory Security -Server $DC -Path "$($SecurityGroupOU)"
+        Write-Host "AD group $GroupName has been built." -ForegroundColor Green
+
+        #region <Force Active Directory replication>
+        Write-Host "Forcing AD internal replication." -ForegroundColor Gray
+        repadmin /syncall $DC /dePqS # | Out-Null  # Uncomment the | Out-Null if you want to hide repadmin results
+        Write-Host "Waiting 15 seconds for replication to finish..."
+        Start-Sleep -Seconds 15
+        #endregion
+    }
+    Else {
+        Write-Host "AD Group $GroupName already exists"
+        Exit
+    }
+    Clear-Variable ADGroupCheck -ErrorAction SilentlyContinue
+}
+
+# Get decision on inheritance
+$Title = 'Disable Inheritance Check'
+$Question = 'Do you want to disable Inheritance and restrict the folder, or add the group to existing permissions?'
+$Choices = '&Restrict', '&Add'
+$Decision = $Host.UI.PromptForChoice($Title, $Question, $Choices, 1)
+if ($decision -eq 0) {
+    Write-Host "Setting Inheritance to be disabled"
+    # Disable Inheritance on the folder
+    $Acl = Get-ACL -Path $Folder
+    # $True disables inheritance $False removes existing permissions
+    $Acl.SetAccessRuleProtection($True, $False)
+    Set-Acl -Path $Folder -AclObject $Acl
+    # Specify Permissions we want to apply
+    $FolderPermissions = "Modify"
+} 
+else {
+    Write-Host "Leaving Inheritance enabled and adding the group to existing security groups"
+    
+    # Since we are adding to the folder we need to check what permissions they need (Read only, or Modify)
+    $Title = 'Permissions Check'
+    $Question = 'What Permissions should the group we are adding have: Read Only or Modify?'
+    $Choices = '&Read Only', '&Modify'
+    $Decision = $Host.UI.PromptForChoice($Title, $Question, $Choices, 1)
+    if ($decision -eq 0) {
+        Write-Host "Setting Permissions to Read Only"
+        $FolderPermissions = "Read"
+    } 
+    else {
+        Write-Host "Setting Permissions to Modify"
+        $FolderPermissions = "Modify"
+    }
+}
+
+# Set the owner to be builtin\administrators
+Set-NTFSOwner -Path $Folder -Account "Builtin\Administrators"
+
+# Add the groups we want Server-AP1\Administrators - Full controll, $GroupName - Whatever option was picked, List folder - List folder only can't see files
+Add-NTFSAccess -Path $Folder -Account "Builtin\Administrators" -AccessRights FullControl
+#Add-NTFSAccess -Path $Folder -Account "R - ListFolderContentsOnlyGroupName" -AppliesTo ThisFolderAndSubfolders -AccessRights Traverse, ListDirectory, ReadPermissions, Read # Usefull if you want to add a list folder contents only group
+Add-NTFSAccess -Path $Folder -Account $GroupName -AccessRights $FolderPermissions
+
+# Check that permissions are correct
+Get-NTFSAccess -Path $Folder
